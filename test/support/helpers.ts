@@ -1,13 +1,3 @@
-/**
- * Test helpers for integration tests.
- *
- * Provides:
- * - Local mock pi CLI via createMockPi()
- * - Dynamic module loading with graceful skip
- * - Temp directory management
- * - Minimal mock contexts for chain execution
- */
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,94 +9,110 @@ export type { MockPi };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ---------------------------------------------------------------------------
-// Mock Pi setup
-// ---------------------------------------------------------------------------
-
-/**
- * Create a mock pi CLI instance for integration tests.
- *
- * Uses the local file-based mock harness in `test/support/mock-pi.ts` and keeps the
- * current Windows-specific `process.argv[1]` / `MOCK_PI_QUEUE_DIR` behavior so
- * `pi-spawn.ts` can keep resolving a runnable script path on Windows.
- */
 export function createMockPi(): MockPi {
 	return _createMockPi();
 }
 
-// ---------------------------------------------------------------------------
-// Temp directory management
-// ---------------------------------------------------------------------------
+export function resolveMockPiCallArgs(call: { args?: readonly string[]; effectiveArgs?: readonly string[] }): string[] {
+	return [...(call.effectiveArgs ?? call.args ?? [])];
+}
 
-/**
- * Create a temporary directory for test use.
- */
 export function createTempDir(prefix = "pi-subagent-test-"): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-/**
- * Remove a directory tree, ignoring errors.
- */
 export function removeTempDir(dir: string): void {
 	try {
 		fs.rmSync(dir, { recursive: true, force: true });
 	} catch {}
 }
 
-// ---------------------------------------------------------------------------
-// Agent config factory
-// ---------------------------------------------------------------------------
+export function createEventBus() {
+	const listeners = new Map<string, Set<(payload: unknown) => void>>();
+	return {
+		on(channel: string, handler: (payload: unknown) => void) {
+			const channelListeners = listeners.get(channel) ?? new Set();
+			channelListeners.add(handler);
+			listeners.set(channel, channelListeners);
+			return () => {
+				channelListeners.delete(handler);
+				if (channelListeners.size === 0) listeners.delete(channel);
+			};
+		},
+		emit(channel: string, payload: unknown) {
+			for (const handler of listeners.get(channel) ?? []) handler(payload);
+		},
+	};
+}
 
 interface AgentConfig {
 	name: string;
+	aliases?: string[];
 	description?: string;
+	defaultContext?: "fresh" | "fork";
 	systemPrompt?: string;
 	model?: string;
 	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
+	subagentOnlyExtensions?: string[];
 	skills?: string[];
+	skillPath?: string[];
+	filePath?: string;
 	thinking?: string;
+	systemPromptMode?: string;
+	inheritProjectContext?: boolean;
+	inheritSkills?: boolean;
 	scope?: string;
 	output?: string | false;
 	reads?: string[] | false;
 	progress?: boolean;
+	toolBudget?: { soft?: number; hard: number; block?: string[] | "*" };
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
+	completionGuard?: boolean;
 }
 
-/**
- * Create minimal agent configs for testing.
- * Each name becomes an agent with no special config.
- */
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
 	return names.map((name) => ({
 		name,
 		description: `Test agent: ${name}`,
+		systemPrompt: "",
+		systemPromptMode: "replace",
+		inheritGlobalContext: false,
+		inheritProjectContext: false,
+		inheritSkills: false,
 	}));
 }
 
-/**
- * Create an agent config with specific settings.
- */
 export function makeAgent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
 		name,
 		description: `Test agent: ${name}`,
+		systemPrompt: "",
+		systemPromptMode: "replace",
+		inheritGlobalContext: false,
+		inheritProjectContext: false,
+		inheritSkills: false,
 		...overrides,
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Minimal mock context for chain execution
-// ---------------------------------------------------------------------------
+interface MinimalCtx {
+	cwd: string;
+	hasUI: boolean;
+	ui: Record<string, never>;
+	sessionManager: {
+		getSessionId: () => string;
+		getSessionFile: () => string | null;
+	};
+	modelRegistry: {
+		getAvailable: () => Array<{ provider: string; id: string }>;
+	};
+	model?: { provider: string; id?: string };
+}
 
-/**
- * Create a minimal ExtensionContext mock for chain execution.
- * Only provides what executeChain needs when clarify=false.
- */
-export function makeMinimalCtx(cwd: string): any {
+export function makeMinimalCtx(cwd: string): MinimalCtx {
 	return {
 		cwd,
 		hasUI: false,
@@ -121,14 +127,10 @@ export function makeMinimalCtx(cwd: string): any {
 	};
 }
 
-// ---------------------------------------------------------------------------
-// Dynamic module loading with graceful skip
-// ---------------------------------------------------------------------------
-
 /**
  * Try to dynamically import a module.
- * - Bare specifiers (e.g., "@marcfargas/pi-test-harness") are imported as-is.
- * - Relative paths (e.g., "./utils.ts") are resolved from the project root.
+ * - Bare specifiers are imported as-is.
+ * - Relative paths (e.g., "./src/shared/utils.ts") are resolved from the project root.
  *
  * Only swallows MODULE_NOT_FOUND / ERR_MODULE_NOT_FOUND when the missing module
  * is exactly the requested bare specifier (expected optional dependency).
@@ -140,17 +142,19 @@ export async function tryImport<T>(specifier: string): Promise<T | null> {
 		if (!isBare) {
 			const projectRoot = path.resolve(__dirname, "..", "..");
 			const abs = path.resolve(projectRoot, specifier);
-			// Convert to file:// URL for cross-platform compatibility with dynamic import()
 			const url = pathToFileURL(abs).href;
 			return await import(url) as T;
 		}
-		// Bare specifier — import directly (node_modules resolution)
 		return await import(specifier) as T;
-	} catch (error: any) {
-		const code = error?.code;
+	} catch (error: unknown) {
+		const code = typeof error === "object" && error !== null && "code" in error
+			? (error as { code?: unknown }).code
+			: undefined;
 		const isModuleNotFound = code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND";
 		if (isBare && isModuleNotFound) {
-			const msg = String(error?.message ?? "");
+			const msg = typeof error === "object" && error !== null && "message" in error
+				? String((error as { message?: unknown }).message ?? "")
+				: "";
 			const missing = msg.match(/Cannot find (?:package|module) ['\"]([^'\"]+)['\"]/i)?.[1];
 			if (missing === specifier || msg.includes(`'${specifier}'`) || msg.includes(`\"${specifier}\"`)) {
 				return null;
@@ -160,11 +164,9 @@ export async function tryImport<T>(specifier: string): Promise<T | null> {
 	}
 }
 
-/**
- * JSONL event builders for mock pi configuration.
- */
+let writeCallSeq = 0;
+
 export const events = {
-	/** Build a message_end event with assistant text */
 	assistantMessage(text: string, model = "mock/test-model"): object {
 		return {
 			type: "message_end",
@@ -172,22 +174,68 @@ export const events = {
 				role: "assistant",
 				content: [{ type: "text", text }],
 				model,
+				stopReason: "stop",
 				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
 			},
 		};
 	},
 
-	/** Build a tool_execution_start event */
+	/** Final assistant turn carrying a satisfied acceptance report. */
+	acceptanceReport(): object {
+		const report = { criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "implemented" }], changedFiles: ["src/file.ts"], testsAddedOrUpdated: ["test/file.test.ts"], commandsRun: [{ command: "npm test", result: "passed", summary: "passed" }], validationOutput: ["tests passed"], residualRisks: [], noStagedFiles: true };
+		return events.assistantMessage(["done", "```acceptance-report", JSON.stringify(report), "```"].join("\n"));
+	},
+
+	/** A child watchdog warning custom message as the child watchdog writes it into the child JSONL. */
+	watchdogWarning(severity: "concern" | "blocker", summary: string, overrides: Record<string, unknown> = {}): object {
+		return {
+			type: "message_end",
+			message: {
+				role: "custom",
+				customType: "subagent_watchdog_warning",
+				content: `<subagent_watchdog severity="${severity}">${summary}</subagent_watchdog>`,
+				display: true,
+				details: { severity, category: "test-gap", source: "child", agent: "worker", summary, evidence: "The transcript claims tests passed but no test command ran.", recommendedAction: "Run the focused test before finishing.", state: "displayed", displayedAt: new Date().toISOString(), ...overrides },
+				timestamp: Date.now(),
+			},
+		};
+	},
+
+	/** Assistant write tool call plus its successful tool result, as one completed write. */
+	completedWrite(filePath: string, content: string, model = "mock/test-model"): object[] {
+		const id = `write-${++writeCallSeq}`;
+		return [
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id, name: "write", arguments: { path: filePath, content } }],
+					model,
+					stopReason: "toolUse",
+					usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+				},
+			},
+			{
+				type: "tool_result_end",
+				message: {
+					role: "toolResult",
+					toolCallId: id,
+					toolName: "write",
+					isError: false,
+					content: [{ type: "text", text: `Wrote ${filePath}` }],
+				},
+			},
+		];
+	},
+
 	toolStart(toolName: string, args: Record<string, unknown> = {}): object {
 		return { type: "tool_execution_start", toolName, args };
 	},
 
-	/** Build a tool_execution_end event */
 	toolEnd(toolName: string): object {
 		return { type: "tool_execution_end", toolName };
 	},
 
-	/** Build a tool_result_end event */
 	toolResult(toolName: string, text: string, isError = false): object {
 		return {
 			type: "tool_result_end",
